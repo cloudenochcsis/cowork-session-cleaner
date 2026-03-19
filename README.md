@@ -120,4 +120,4 @@ MIT. Use it however you like.
 
 ## Credits
 
-Archive/unarchive approach based on [this Reddit post](https://www.reddit.com/r/ClaudeAI/) documenting the `isArchived` flag in Cowork session metadata.
+Archive/unarchive approach inspired by [this Reddit post](https://www.reddit.com/r/ClaudeAI/comments/1qqaung/where_are_archived_cowork_chats/) documenting the `isArchived` flag in Cowork session metadata.
