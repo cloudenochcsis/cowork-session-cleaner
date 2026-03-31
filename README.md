@@ -6,12 +6,15 @@ A Python script to list, delete, archive, and unarchive your Claude Cowork sessi
 
 Claude's Cowork mode stores sessions locally on your Mac, but there is currently no built-in UI to bulk-delete sessions or view/restore archived chats. Over time, sessions pile up, eat disk space, and there is no straightforward way to clean them up. Archived chats simply disappear from the sidebar with no option to bring them back through the app.
 
+Worse, if session data is manually deleted, the JSON metadata files often get left behind — causing ghost entries to linger in the Claude sidebar with no content.
+
 This script gives you visibility into all your Cowork sessions and lets you manage them directly.
 
 ## What It Does
 
 - Lists all Cowork sessions with their title, last modified date, size, and archive status
-- **Delete** sessions to free up disk space
+- **Detects orphaned sessions** — metadata files left behind after session data was deleted, which cause ghost entries in the Claude sidebar
+- **Delete** sessions to free up disk space (removes both session data and metadata)
 - **Archive** sessions to hide them from the Cowork sidebar
 - **Unarchive** sessions to restore previously archived chats
 - Dry-run mode to preview changes before committing
@@ -48,8 +51,11 @@ python3 cowork_session_cleaner.py --active
 ```
 ==========================================================================================
   Cowork Session Manager
-  12 session(s)  |  9 active, 3 archived  |  245.3 MB total
+  12 session(s) | 8 active | 2 archived | 2 orphaned  |  245.3 MB total
 ==========================================================================================
+
+  ⚠  2 orphaned session(s) found (metadata without session data).
+     These still appear in the Claude sidebar. Delete them to clean up.
 
     #  Status     Last Modified        Size  Title / Session ID
   ---  --------   ----------------   ----------  ----------------------------------------
@@ -57,7 +63,7 @@ python3 cowork_session_cleaner.py --active
     2  active     2026-03-18 09:10     38.1 MB  Help me write a cover letter
     3  ARCHIVED   2026-03-15 16:45     12.7 MB  Budget spreadsheet cleanup
     4  active     2026-03-12 11:30      8.4 MB  Debug my Python script
-    5  ARCHIVED   2026-03-01 08:55      3.2 MB  Meeting notes summary
+    5  ORPHANED   2026-03-01 08:55    178.3 KB  Old project notes
   ...
 
   What would you like to do?
@@ -66,22 +72,22 @@ python3 cowork_session_cleaner.py --active
     [U] Unarchive sessions (restore to Cowork)
     [Q] Quit
 
-  Action: u
+  Action: d
 
   Enter session numbers.
   Examples: 1,3,5  or  1-5  or  all
 
-  Select: 3,5
+  Select: 5
 
-  Sessions to UNARCHIVE (2):
-    - Budget spreadsheet cleanup  (2026-03-15 16:45)
-    - Meeting notes summary  (2026-03-01 08:55)
+  Sessions to DELETE (178.3 KB):
 
-  Confirm UNARCHIVE? (yes/no): yes
-  Unarchived: Budget spreadsheet cleanup
-  Unarchived: Meeting notes summary
+    - Old project notes  (178.3 KB, 2026-03-01 08:55)  [orphaned metadata only]
 
-  Done. Unarchived 2 session(s). Restart Claude for changes to take effect.
+  Confirm DELETE? This is permanent. (yes/no): yes
+  Deleted: Old project notes
+
+  Done. Deleted 1 session(s), freed 178.3 KB.
+  Restart Claude for sidebar changes to take effect.
 ```
 
 ## How It Works
@@ -91,9 +97,11 @@ Cowork sessions live at:
 ~/Library/Application Support/Claude/local-agent-mode-sessions/<org-uuid>/<project-uuid>/local_<session-uuid>/
 ```
 
-Each session has a corresponding JSON metadata file. The script reads these to get the session title and archive status. Archiving and unarchiving works by setting `"isArchived": true` or `false` in that JSON file, which is how the Claude app tracks visibility. You need to restart the Claude app after archiving or unarchiving for the changes to appear.
+Each session has a corresponding `local_<session-uuid>.json` metadata file in the project directory. The Claude app reads these JSON files to populate the sidebar — they contain the session title, archive status, and other metadata.
 
-Deleting removes the entire session folder and its metadata permanently.
+- **Archiving/Unarchiving** sets `"isArchived": true` or `false` in the JSON file. Restart the Claude app for changes to appear.
+- **Deleting** removes both the session folder and the JSON metadata file. This is important because deleting only the folder leaves the JSON behind, which causes the session to appear as a ghost entry in the sidebar (visible but empty).
+- **Orphan detection** finds JSON metadata files that have no matching session directory. These are leftovers from previous deletions and can be cleaned up to remove ghost sidebar entries.
 
 ## Limitations
 
