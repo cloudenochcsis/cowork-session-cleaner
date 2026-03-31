@@ -64,10 +64,10 @@ python3 cowork_session_cleaner.py --active
 
     #  Kind   Status     Last Modified            Size  Title / Session ID
   ---  ----   --------   ----------------   ----------  ----------------------------------------
-    1  CODE   LIVE       2026-03-31 18:09     131.1 KB  Assess Axios security incident impact
-    2  CODE   active     2026-03-26 10:05       1.6 MB  Pull AI Like Me staging code from GitHub
-    3  CODE   active     2026-03-19 08:32     293.1 KB  Fix feature-update branch to match main...
-    4  COWORK active     2026-03-31 21:31     417.6 KB  Review SEO improvement reports and progress
+    1  CODE   LIVE       2026-03-31 18:09     131.1 KB  Investigate dependency security alert
+    2  CODE   active     2026-03-26 10:05       1.6 MB  Sync staging branch with remote
+    3  CODE   active     2026-03-19 08:32     293.1 KB  Align feature branch with main...
+    4  COWORK active     2026-03-31 21:31     417.6 KB  Review quarterly content updates
 
   What would you like to do?
     [D] Delete sessions
