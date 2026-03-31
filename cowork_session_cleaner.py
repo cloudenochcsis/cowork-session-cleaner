@@ -138,7 +138,7 @@ def set_archive_status(json_path, archived):
 
 
 def discover_sessions():
-    """Walk the sessions root and find all individual session folders."""
+    """Walk the sessions root and find all individual session folders and orphaned JSON files."""
     sessions = []
 
     if not SESSIONS_ROOT.exists():
@@ -151,11 +151,18 @@ def discover_sessions():
         for project_dir in org_dir.iterdir():
             if not project_dir.is_dir():
                 continue
+
+            # Track which session UUIDs have directories
+            seen_uuids = set()
+
             for session_dir in project_dir.iterdir():
                 if not session_dir.is_dir():
                     continue
                 if not session_dir.name.startswith("local_"):
                     continue
+
+                session_uuid = session_dir.name.replace("local_", "")
+                seen_uuids.add(session_uuid)
 
                 size = get_folder_size(session_dir)
                 last_mod = get_last_modified(session_dir)
@@ -178,6 +185,51 @@ def discover_sessions():
                     "is_archived": is_archived,
                     "json_path": json_path,
                     "title": title,
+                    "orphaned": False,
+                })
+
+            # Find orphaned JSON files: metadata with no matching session directory
+            for json_file in project_dir.iterdir():
+                if not json_file.is_file():
+                    continue
+                if not json_file.name.startswith("local_") or not json_file.suffix == ".json":
+                    continue
+                session_uuid = json_file.stem.replace("local_", "")
+                if session_uuid in seen_uuids:
+                    continue  # has a directory, already discovered
+
+                # Orphaned JSON — session dir was deleted but metadata remains
+                try:
+                    with open(json_file, "r") as f:
+                        data = json.load(f)
+                    title = data.get("title") or data.get("name") or None
+                    is_archived = data.get("isArchived", False)
+                    last_mod = os.path.getmtime(json_file)
+                except (json.JSONDecodeError, OSError):
+                    title = None
+                    is_archived = False
+                    last_mod = 0
+
+                last_mod_str = (
+                    datetime.fromtimestamp(last_mod).strftime("%Y-%m-%d %H:%M")
+                    if last_mod > 0
+                    else "unknown"
+                )
+                size = json_file.stat().st_size if json_file.exists() else 0
+
+                sessions.append({
+                    "path": None,  # no directory exists
+                    "name": f"local_{session_uuid}",
+                    "org": org_dir.name[:8] + "...",
+                    "project": project_dir.name[:8] + "...",
+                    "size": size,
+                    "size_str": human_size(size),
+                    "last_modified": last_mod,
+                    "last_modified_str": last_mod_str,
+                    "is_archived": is_archived,
+                    "json_path": json_file,
+                    "title": title,
+                    "orphaned": True,
                 })
 
     return sessions
@@ -191,12 +243,20 @@ def display_sessions(sessions, show_title="auto"):
 
     total_size = sum(s["size"] for s in sessions)
     archived_count = sum(1 for s in sessions if s["is_archived"])
+    orphaned_count = sum(1 for s in sessions if s.get("orphaned"))
     active_count = len(sessions) - archived_count
 
     print(f"\n{'='*90}")
     print(f"  Cowork Session Manager")
-    print(f"  {len(sessions)} session(s)  |  {active_count} active, {archived_count} archived  |  {human_size(total_size)} total")
+    summary_parts = [f"{len(sessions)} session(s)", f"{active_count} active", f"{archived_count} archived"]
+    if orphaned_count > 0:
+        summary_parts.append(f"{orphaned_count} orphaned")
+    print(f"  {' | '.join(summary_parts)}  |  {human_size(total_size)} total")
     print(f"{'='*90}\n")
+
+    if orphaned_count > 0:
+        print(f"  ⚠  {orphaned_count} orphaned session(s) found (metadata without session data).")
+        print(f"     These still appear in the Claude sidebar. Delete them to clean up.\n")
 
     # Decide whether to show title column
     has_titles = any(s["title"] for s in sessions)
@@ -212,7 +272,12 @@ def display_sessions(sessions, show_title="auto"):
 
     for i, s in enumerate(sessions, 1):
         session_id = s["name"].replace("local_", "")
-        status = "ARCHIVED" if s["is_archived"] else "active"
+        if s.get("orphaned"):
+            status = "ORPHANED"
+        elif s["is_archived"]:
+            status = "ARCHIVED"
+        else:
+            status = "active"
         display_name = s["title"] if s.get("title") else session_id
         # Truncate long titles
         if len(display_name) > 50:
@@ -264,15 +329,19 @@ def parse_selection(text, count):
 def action_delete(sessions, selected, dry_run):
     """Delete selected sessions."""
     total_reclaim = sum(s["size"] for s in selected)
+    orphaned_count = sum(1 for s in selected if s.get("orphaned"))
 
     print(f"\n  Sessions to DELETE ({human_size(total_reclaim)}):\n")
     for s in selected:
         session_id = s["name"].replace("local_", "")
         label = s["title"] or session_id
-        print(f"    - {label}  ({s['size_str']}, {s['last_modified_str']})")
+        suffix = "  [orphaned metadata only]" if s.get("orphaned") else ""
+        print(f"    - {label}  ({s['size_str']}, {s['last_modified_str']}){suffix}")
 
     if dry_run:
         print(f"\n  [DRY RUN] Would delete {len(selected)} session(s), freeing {human_size(total_reclaim)}.")
+        if orphaned_count:
+            print(f"  [DRY RUN] {orphaned_count} orphaned metadata file(s) would be removed from sidebar.")
         return
 
     print()
@@ -290,9 +359,12 @@ def action_delete(sessions, selected, dry_run):
     freed = 0
     for s in selected:
         try:
-            shutil.rmtree(s["path"])
-            # Also remove the json metadata if it exists outside the session dir
-            if s["json_path"] and s["json_path"].exists() and s["json_path"].parent != s["path"]:
+            # Delete the session directory if it exists
+            if s["path"] and s["path"].exists():
+                shutil.rmtree(s["path"])
+            # Always remove the JSON metadata file (this is what the Claude
+            # sidebar reads — leaving it behind causes ghost entries)
+            if s["json_path"] and s["json_path"].exists():
                 s["json_path"].unlink(missing_ok=True)
             deleted += 1
             freed += s["size"]
@@ -302,6 +374,7 @@ def action_delete(sessions, selected, dry_run):
             print(f"  Error deleting {s['name']}: {e}")
 
     print(f"\n  Done. Deleted {deleted} session(s), freed {human_size(freed)}.")
+    print(f"  Restart Claude for sidebar changes to take effect.")
 
 
 def action_archive(sessions, selected, dry_run):
