@@ -1,37 +1,45 @@
-# Cowork Session Manager
+# Claude Session Manager
 
-A Python script to list, delete, archive, and unarchive your Claude Cowork sessions from the command line.
+A Python script to list, delete, archive, and unarchive your Claude Desktop Cowork and Code sessions from the command line.
 
 ## The Problem
 
-Claude's Cowork mode stores sessions locally on your Mac, but there is currently no built-in UI to bulk-delete sessions or view/restore archived chats. Over time, sessions pile up, eat disk space, and there is no straightforward way to clean them up. Archived chats simply disappear from the sidebar with no option to bring them back through the app.
+Claude Desktop lets you delete standard chats from the UI, but Cowork and Code sessions are stored locally and can pile up with no equivalent cleanup workflow. Over time, these sessions consume disk space, clutter the sidebar, and are hard to manage in bulk.
 
-Worse, if session data is manually deleted, the JSON metadata files often get left behind — causing ghost entries to linger in the Claude sidebar with no content.
+Worse, if session data is manually deleted, metadata files can get left behind — causing ghost entries to linger in the Claude sidebar with no usable content.
 
-This script gives you visibility into all your Cowork sessions and lets you manage them directly.
+This script gives you visibility into local Claude session storage and lets you manage Cowork and Code sessions directly.
 
 ## What It Does
 
-- Lists all Cowork sessions with their title, last modified date, size, and archive status
-- **Detects orphaned sessions** — metadata files left behind after session data was deleted, which cause ghost entries in the Claude sidebar
-- **Delete** sessions to free up disk space (removes both session data and metadata)
-- **Archive** sessions to hide them from the Cowork sidebar
-- **Unarchive** sessions to restore previously archived chats
+- Lists both Cowork and Code sessions with their title, last modified date, size, kind, and archive status
+- **Detects orphaned Cowork sessions** — metadata files left behind after session data was deleted, which cause ghost entries in the Claude sidebar
+- **Delete** Cowork sessions to free up disk space by removing both session data and metadata
+- **Delete** Code sessions by removing sidebar metadata, transcript history, stale session references, and the matching `git-worktrees.json` entry
+- **Archive** sessions to hide them from the Claude sidebar
+- **Unarchive** sessions to restore previously archived sessions
+- Refuses to delete **live Code sessions** that Claude Desktop is still using
 - Dry-run mode to preview changes before committing
 - Sort by date, size, or name
-- Filter to show only archived or only active sessions
+- Filter by archived/active status or by session kind
 
 ## Requirements
 
-- macOS (sessions are stored at `~/Library/Application Support/Claude/local-agent-mode-sessions/`)
+- macOS
 - Python 3.8+
 - No external dependencies (standard library only)
 
 ## Usage
 
 ```bash
-# List all sessions and choose an action
+# List all Cowork and Code sessions and choose an action
 python3 cowork_session_cleaner.py
+
+# Only manage Code sessions
+python3 cowork_session_cleaner.py --kind code
+
+# Only manage Cowork sessions
+python3 cowork_session_cleaner.py --kind cowork
 
 # Preview without making any changes
 python3 cowork_session_cleaner.py --dry-run
@@ -39,83 +47,93 @@ python3 cowork_session_cleaner.py --dry-run
 # Sort by size to find the biggest sessions
 python3 cowork_session_cleaner.py --sort size
 
-# Show only archived sessions (useful for finding chats to restore)
+# Show only archived sessions
 python3 cowork_session_cleaner.py --archived
 
-# Show only active sessions
+# Show only active (non-archived) sessions
 python3 cowork_session_cleaner.py --active
 ```
 
 ## Example Output
 
-```
-==========================================================================================
-  Cowork Session Manager
-  12 session(s) | 8 active | 2 archived | 2 orphaned  |  245.3 MB total
-==========================================================================================
+```text
+========================================================================================================
+  Claude Session Manager
+  4 session(s) | 1 cowork | 3 code | 4 active | 0 archived | 1 live code  |  2.4 MB total
+========================================================================================================
 
-  ⚠  2 orphaned session(s) found (metadata without session data).
-     These still appear in the Claude sidebar. Delete them to clean up.
-
-    #  Status     Last Modified        Size  Title / Session ID
-  ---  --------   ----------------   ----------  ----------------------------------------
-    1  active     2026-03-19 14:22     52.3 MB  Website redesign project
-    2  active     2026-03-18 09:10     38.1 MB  Help me write a cover letter
-    3  ARCHIVED   2026-03-15 16:45     12.7 MB  Budget spreadsheet cleanup
-    4  active     2026-03-12 11:30      8.4 MB  Debug my Python script
-    5  ORPHANED   2026-03-01 08:55    178.3 KB  Old project notes
-  ...
+    #  Kind   Status     Last Modified            Size  Title / Session ID
+  ---  ----   --------   ----------------   ----------  ----------------------------------------
+    1  CODE   LIVE       2026-03-31 18:09     131.1 KB  Assess Axios security incident impact
+    2  CODE   active     2026-03-26 10:05       1.6 MB  Pull AI Like Me staging code from GitHub
+    3  CODE   active     2026-03-19 08:32     293.1 KB  Fix feature-update branch to match main...
+    4  COWORK active     2026-03-31 21:31     417.6 KB  Review SEO improvement reports and progress
 
   What would you like to do?
     [D] Delete sessions
-    [A] Archive sessions (hide from Cowork)
-    [U] Unarchive sessions (restore to Cowork)
+    [A] Archive sessions (hide from the Claude sidebar)
+    [U] Unarchive sessions (restore to the Claude sidebar)
     [Q] Quit
-
-  Action: d
-
-  Enter session numbers.
-  Examples: 1,3,5  or  1-5  or  all
-
-  Select: 5
-
-  Sessions to DELETE (178.3 KB):
-
-    - Old project notes  (178.3 KB, 2026-03-01 08:55)  [orphaned metadata only]
-
-  Confirm DELETE? This is permanent. (yes/no): yes
-  Deleted: Old project notes
-
-  Done. Deleted 1 session(s), freed 178.3 KB.
-  Restart Claude for sidebar changes to take effect.
 ```
 
 ## How It Works
 
+### Cowork sessions
+
 Cowork sessions live at:
-```
+
+```text
 ~/Library/Application Support/Claude/local-agent-mode-sessions/<org-uuid>/<project-uuid>/local_<session-uuid>/
 ```
 
-Each session has a corresponding `local_<session-uuid>.json` metadata file in the project directory. The Claude app reads these JSON files to populate the sidebar — they contain the session title, archive status, and other metadata. The cleaner prefers this documented filename and also falls back to legacy `<session-uuid>.json` metadata files if they are present.
+Each session has a corresponding `local_<session-uuid>.json` metadata file in the project directory. The cleaner prefers this documented filename and also falls back to legacy `<session-uuid>.json` metadata files if they are present.
 
-- **Archiving/Unarchiving** sets `"isArchived": true` or `false` in the JSON file. Restart the Claude app for changes to appear.
-- **Deleting** removes both the session folder and the JSON metadata file. This is important because deleting only the folder leaves the JSON behind, which causes the session to appear as a ghost entry in the sidebar (visible but empty).
-- **Orphan detection** finds JSON metadata files that have no matching session directory. These are leftovers from previous deletions and can be cleaned up to remove ghost sidebar entries.
+- **Archiving/Unarchiving** sets `"isArchived": true` or `false` in the JSON file.
+- **Deleting** removes both the session folder and the JSON metadata file.
+- **Orphan detection** finds JSON metadata files that have no matching session directory.
+
+### Code sessions
+
+Code sessions are stored across a few Claude Desktop locations:
+
+- Sidebar metadata:
+  `~/Library/Application Support/Claude/claude-code-sessions/<org>/<project>/local_<session-uuid>.json`
+- Worktree registry:
+  `~/Library/Application Support/Claude/git-worktrees.json`
+- Transcript history:
+  `~/.claude/projects/<normalized-worktree-path>/<cliSessionId>.jsonl`
+- Live session references:
+  `~/.claude/sessions/<pid>.json`
+
+For Code sessions, the script:
+
+- reads the sidebar metadata JSON to list titles, timestamps, and archive state
+- indexes transcript files by `cliSessionId`
+- detects live Code sessions via `~/.claude/sessions`
+- removes the matching `git-worktrees.json` entry during deletion
+
+By default, deleting a Code session does **not** delete the linked git worktree directory. That keeps the cleanup focused on Claude session artifacts instead of repository contents.
+
+## Safety Notes
+
+- Live Code sessions are blocked from deletion while their PID is still active.
+- Archive/unarchive works by editing local metadata and does not touch your repository.
+- Restart Claude Desktop after delete/archive/unarchive operations for sidebar changes to appear.
 
 ## Limitations
 
-- macOS only for now (the session path is Mac-specific)
-- You need to restart the Claude desktop app after archive/unarchive operations
-- Session titles depend on what the Claude app saved in the JSON metadata. Some sessions may only show their UUID if no title was stored.
+- macOS only for now
+- Session titles depend on what Claude saved in the metadata JSON
+- Code transcript discovery is based on `cliSessionId` matches under `~/.claude/projects`
+- The script intentionally does **not** delete Code worktree directories by default
 
 ## Contributing
 
 Suggestions and improvements are welcome. Some ideas:
 
-- **Windows/Linux support** - adapt the session storage path for other platforms
+- **Windows/Linux support** - adapt the session storage paths for other platforms
 - **Search by title** - filter sessions by keyword instead of scrolling through the list
-- **Export session data** - dump conversation content before deleting
+- **Optional worktree deletion** - add an explicit flag for removing Code worktrees too
 - **Auto-detect Claude running** - warn or auto-restart the app after changes
 - **Age-based cleanup** - flag or auto-archive sessions older than N days
 - **TUI interface** - use curses or a library like `rich` for a nicer interactive experience

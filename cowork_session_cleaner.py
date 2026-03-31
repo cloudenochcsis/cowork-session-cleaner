@@ -1,36 +1,47 @@
 #!/usr/bin/env python3
 """
-Cowork Session Manager
+Claude Session Manager
 ----------------------
-Lists all Claude Cowork local sessions, shows their size, date, and archive
+Lists Claude Cowork and Code sessions, shows their size, date, and archive
 status. Lets you delete, archive, or unarchive sessions interactively.
 
 Usage:
     python3 cowork_session_cleaner.py                    # default: manage all sessions
+    python3 cowork_session_cleaner.py --kind code        # manage only Code sessions
     python3 cowork_session_cleaner.py --dry-run          # preview without changes
-    python3 cowork_session_cleaner.py --sort size         # sort by size (default: date)
-    python3 cowork_session_cleaner.py --sort name         # sort alphabetically
-    python3 cowork_session_cleaner.py --archived          # show only archived sessions
-    python3 cowork_session_cleaner.py --active            # show only active sessions
+    python3 cowork_session_cleaner.py --sort size        # sort by size (default: date)
+    python3 cowork_session_cleaner.py --sort name        # sort alphabetically
+    python3 cowork_session_cleaner.py --archived         # show only archived sessions
+    python3 cowork_session_cleaner.py --active           # show only active sessions
 
 Actions menu:
-    [D] Delete   - permanently remove selected sessions
-    [A] Archive  - hide sessions from Cowork UI
-    [U] Unarchive - restore archived sessions to Cowork UI
-    (Restart the Claude app after archiving/unarchiving for changes to take effect)
+    [D] Delete    - permanently remove selected sessions
+    [A] Archive   - hide sessions from the Claude sidebar
+    [U] Unarchive - restore archived sessions to the Claude sidebar
+    (Restart the Claude app after deleting, archiving, or unarchiving for
+    changes to take effect)
 """
 
-import os
-import sys
-import json
-import shutil
 import argparse
+import json
+import os
+import shutil
+import sys
 import uuid
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 
 
-SESSIONS_ROOT = Path.home() / "Library" / "Application Support" / "Claude" / "local-agent-mode-sessions"
+COWORK_SESSIONS_ROOT = Path.home() / "Library" / "Application Support" / "Claude" / "local-agent-mode-sessions"
+CODE_SESSIONS_ROOT = Path.home() / "Library" / "Application Support" / "Claude" / "claude-code-sessions"
+GIT_WORKTREES_PATH = Path.home() / "Library" / "Application Support" / "Claude" / "git-worktrees.json"
+CLI_SESSIONS_ROOT = Path.home() / ".claude" / "sessions"
+CLI_PROJECTS_ROOT = Path.home() / ".claude" / "projects"
+
+
+def session_id_from_uuid(session_uuid):
+    """Return Claude's local session identifier for a UUID."""
+    return f"local_{session_uuid}"
 
 
 def session_metadata_candidate_names(session_uuid):
@@ -59,16 +70,38 @@ def extract_session_uuid_from_metadata_path(path):
         return None
 
 
+def read_json_file(path):
+    """Read a JSON file and return the parsed value, or None on error."""
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def write_json_file(path, data):
+    """Write JSON data with stable formatting."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+
+
+def get_file_size(path):
+    """Get the size of a file in bytes."""
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
 def get_folder_size(path):
     """Calculate total size of a directory in bytes."""
     total = 0
     for dirpath, dirnames, filenames in os.walk(path):
-        for f in filenames:
-            fp = os.path.join(dirpath, f)
-            try:
-                total += os.path.getsize(fp)
-            except OSError:
-                pass
+        for filename in filenames:
+            file_path = Path(dirpath) / filename
+            total += get_file_size(file_path)
     return total
 
 
@@ -81,19 +114,133 @@ def human_size(num_bytes):
     return f"{num_bytes:.1f} TB"
 
 
+def normalize_timestamp(timestamp):
+    """Normalize Claude timestamps to epoch seconds."""
+    if not timestamp:
+        return 0
+
+    timestamp = float(timestamp)
+    if timestamp > 10**12:
+        timestamp /= 1000.0
+    return timestamp
+
+
+def format_timestamp(timestamp):
+    """Render a timestamp for display."""
+    normalized = normalize_timestamp(timestamp)
+    if normalized <= 0:
+        return "unknown"
+    return datetime.fromtimestamp(normalized).strftime("%Y-%m-%d %H:%M")
+
+
 def get_last_modified(path):
     """Get the most recent modification time across all files in a directory."""
     latest = 0
     for dirpath, dirnames, filenames in os.walk(path):
-        for f in filenames:
-            fp = os.path.join(dirpath, f)
+        for filename in filenames:
+            file_path = Path(dirpath) / filename
             try:
-                mtime = os.path.getmtime(fp)
+                mtime = file_path.stat().st_mtime
                 if mtime > latest:
                     latest = mtime
             except OSError:
                 pass
     return latest
+
+
+def short_label(value):
+    """Shorten long org/project identifiers for display."""
+    return value if len(value) <= 8 else value[:8] + "..."
+
+
+def get_session_label(session):
+    """Return the best display label for a session."""
+    return session["title"] or session["session_uuid"]
+
+
+def remove_empty_parents(path, stop_at):
+    """Remove empty parent directories up to, but not including, stop_at."""
+    current = Path(path)
+    stop_at = Path(stop_at)
+
+    while current != stop_at and stop_at in current.parents:
+        try:
+            current.rmdir()
+        except OSError:
+            break
+        current = current.parent
+
+
+def is_pid_running(pid):
+    """Return True when a PID exists and is reachable."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def make_session_record(
+    kind,
+    session_id,
+    org,
+    project,
+    size,
+    last_modified,
+    *,
+    path=None,
+    json_path=None,
+    title=None,
+    is_archived=False,
+    orphaned=False,
+    cli_session_id=None,
+    history_paths=None,
+    worktree_path=None,
+    worktree_name=None,
+    stale_session_files=None,
+    live_session_files=None,
+    live_pids=None,
+):
+    """Create a normalized session record for display and actions."""
+    session_uuid = session_id.replace("local_", "", 1) if session_id.startswith("local_") else session_id
+    history_paths = list(history_paths or [])
+    stale_session_files = list(stale_session_files or [])
+    live_session_files = list(live_session_files or [])
+    live_pids = list(live_pids or [])
+    worktree_path = Path(worktree_path) if worktree_path else None
+    last_modified = normalize_timestamp(last_modified)
+
+    return {
+        "kind": kind,
+        "path": path,
+        "name": session_id,
+        "session_id": session_id,
+        "session_uuid": session_uuid,
+        "org": short_label(org),
+        "project": short_label(project),
+        "size": size,
+        "size_str": human_size(size),
+        "last_modified": last_modified,
+        "last_modified_str": format_timestamp(last_modified),
+        "is_archived": is_archived,
+        "json_path": json_path,
+        "title": title,
+        "orphaned": orphaned,
+        "cli_session_id": cli_session_id,
+        "history_paths": history_paths,
+        "worktree_path": worktree_path,
+        "worktree_name": worktree_name,
+        "stale_session_files": stale_session_files,
+        "live_session_files": live_session_files,
+        "live_pids": live_pids,
+    }
 
 
 def find_session_json(session_dir):
@@ -103,7 +250,7 @@ def find_session_json(session_dir):
     session_dir). Some older or unexpected layouts may use <uuid>.json instead, so
     we check both names in both locations.
     """
-    session_uuid = session_dir.name.replace("local_", "")
+    session_uuid = session_dir.name.replace("local_", "", 1)
     candidate_names = session_metadata_candidate_names(session_uuid)
 
     # Prefer the documented location first: project-level metadata next to
@@ -124,6 +271,12 @@ def find_session_json(session_dir):
     return None
 
 
+def read_session_metadata(json_path):
+    """Read a session metadata file as an object."""
+    data = read_json_file(json_path)
+    return data if isinstance(data, dict) else None
+
+
 def get_archive_status(session_dir):
     """
     Read the session JSON and return archive status.
@@ -133,14 +286,13 @@ def get_archive_status(session_dir):
     if json_path is None:
         return False, None, None
 
-    try:
-        with open(json_path, "r") as f:
-            data = json.load(f)
-        is_archived = data.get("isArchived", False)
-        title = data.get("title") or data.get("name") or None
-        return is_archived, json_path, title
-    except (json.JSONDecodeError, OSError):
+    data = read_session_metadata(json_path)
+    if data is None:
         return False, json_path, None
+
+    is_archived = data.get("isArchived", False)
+    title = data.get("title") or data.get("name") or None
+    return is_archived, json_path, title
 
 
 def set_archive_status(json_path, archived):
@@ -151,161 +303,308 @@ def set_archive_status(json_path, archived):
     try:
         with open(json_path, "r") as f:
             data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("JSON root is not an object")
         data["isArchived"] = archived
-        with open(json_path, "w") as f:
-            json.dump(data, f, indent=2)
+        write_json_file(json_path, data)
         return True
-    except (json.JSONDecodeError, OSError) as e:
+    except (json.JSONDecodeError, OSError, ValueError) as e:
         print(f"  Error updating {json_path.name}: {e}")
         return False
 
 
-def discover_sessions():
-    """Walk the sessions root and find all individual session folders and orphaned JSON files."""
+def load_git_worktrees():
+    """Load Claude's code worktree registry."""
+    data = read_json_file(GIT_WORKTREES_PATH)
+    if not isinstance(data, dict):
+        return {"worktrees": {}}
+
+    worktrees = data.get("worktrees")
+    if not isinstance(worktrees, dict):
+        data["worktrees"] = {}
+    return data
+
+
+def remove_git_worktree_entry(session_id):
+    """Remove a code session entry from git-worktrees.json."""
+    data = load_git_worktrees()
+    worktrees = data.setdefault("worktrees", {})
+    if session_id not in worktrees:
+        return False
+
+    del worktrees[session_id]
+    write_json_file(GIT_WORKTREES_PATH, data)
+    return True
+
+
+def build_transcript_index():
+    """Index Code session transcripts by cliSessionId."""
+    transcripts = {}
+    if not CLI_PROJECTS_ROOT.exists():
+        return transcripts
+
+    for transcript_path in CLI_PROJECTS_ROOT.rglob("*.jsonl"):
+        transcripts.setdefault(transcript_path.stem, []).append(transcript_path)
+    return transcripts
+
+
+def load_active_code_sessions():
+    """Index live and stale Code session pointer files by cliSessionId."""
+    active_sessions = {}
+    if not CLI_SESSIONS_ROOT.exists():
+        return active_sessions
+
+    for session_file in CLI_SESSIONS_ROOT.glob("*.json"):
+        data = read_json_file(session_file)
+        if not isinstance(data, dict):
+            continue
+
+        cli_session_id = data.get("sessionId")
+        if not isinstance(cli_session_id, str) or not cli_session_id:
+            continue
+
+        pid = data.get("pid")
+        if isinstance(pid, str) and pid.isdigit():
+            pid = int(pid)
+        elif not isinstance(pid, int):
+            pid = None
+
+        entry = active_sessions.setdefault(
+            cli_session_id,
+            {"live_files": [], "stale_files": [], "live_pids": []},
+        )
+
+        if pid is not None and is_pid_running(pid):
+            entry["live_files"].append(session_file)
+            entry["live_pids"].append(pid)
+        else:
+            entry["stale_files"].append(session_file)
+
+    return active_sessions
+
+
+def discover_cowork_sessions():
+    """Walk the Cowork sessions root and find session folders and orphaned metadata."""
     sessions = []
+    if not COWORK_SESSIONS_ROOT.exists():
+        return sessions
 
-    if not SESSIONS_ROOT.exists():
-        print(f"Sessions directory not found: {SESSIONS_ROOT}")
-        sys.exit(1)
-
-    for org_dir in SESSIONS_ROOT.iterdir():
+    for org_dir in COWORK_SESSIONS_ROOT.iterdir():
         if not org_dir.is_dir():
             continue
+
         for project_dir in org_dir.iterdir():
             if not project_dir.is_dir():
                 continue
 
-            # Track which session UUIDs have directories
             seen_uuids = set()
 
             for session_dir in project_dir.iterdir():
-                if not session_dir.is_dir():
-                    continue
-                if not session_dir.name.startswith("local_"):
+                if not session_dir.is_dir() or not session_dir.name.startswith("local_"):
                     continue
 
-                session_uuid = session_dir.name.replace("local_", "")
+                session_uuid = session_dir.name.replace("local_", "", 1)
                 seen_uuids.add(session_uuid)
-
                 size = get_folder_size(session_dir)
                 last_mod = get_last_modified(session_dir)
-                last_mod_str = (
-                    datetime.fromtimestamp(last_mod).strftime("%Y-%m-%d %H:%M")
-                    if last_mod > 0
-                    else "unknown"
-                )
                 is_archived, json_path, title = get_archive_status(session_dir)
 
-                sessions.append({
-                    "path": session_dir,
-                    "name": session_dir.name,
-                    "org": org_dir.name[:8] + "...",
-                    "project": project_dir.name[:8] + "...",
-                    "size": size,
-                    "size_str": human_size(size),
-                    "last_modified": last_mod,
-                    "last_modified_str": last_mod_str,
-                    "is_archived": is_archived,
-                    "json_path": json_path,
-                    "title": title,
-                    "orphaned": False,
-                })
+                sessions.append(
+                    make_session_record(
+                        "cowork",
+                        session_id_from_uuid(session_uuid),
+                        org_dir.name,
+                        project_dir.name,
+                        size,
+                        last_mod,
+                        path=session_dir,
+                        json_path=json_path,
+                        title=title,
+                        is_archived=is_archived,
+                    )
+                )
 
-            # Find orphaned JSON files: metadata with no matching session directory
             for json_file in project_dir.iterdir():
                 if not json_file.is_file():
                     continue
+
                 session_uuid = extract_session_uuid_from_metadata_path(json_file)
-                if session_uuid is None:
+                if session_uuid is None or session_uuid in seen_uuids:
                     continue
-                if session_uuid in seen_uuids:
-                    continue  # has a directory, already discovered
 
-                # Orphaned JSON — session dir was deleted but metadata remains
-                try:
-                    with open(json_file, "r") as f:
-                        data = json.load(f)
-                    title = data.get("title") or data.get("name") or None
-                    is_archived = data.get("isArchived", False)
-                    last_mod = os.path.getmtime(json_file)
-                except (json.JSONDecodeError, OSError):
-                    title = None
-                    is_archived = False
-                    last_mod = 0
+                data = read_session_metadata(json_file)
+                title = data.get("title") or data.get("name") or None if data else None
+                is_archived = data.get("isArchived", False) if data else False
+                last_mod = json_file.stat().st_mtime if json_file.exists() else 0
+                size = get_file_size(json_file)
 
-                last_mod_str = (
-                    datetime.fromtimestamp(last_mod).strftime("%Y-%m-%d %H:%M")
-                    if last_mod > 0
-                    else "unknown"
+                sessions.append(
+                    make_session_record(
+                        "cowork",
+                        session_id_from_uuid(session_uuid),
+                        org_dir.name,
+                        project_dir.name,
+                        size,
+                        last_mod,
+                        json_path=json_file,
+                        title=title,
+                        is_archived=is_archived,
+                        orphaned=True,
+                    )
                 )
-                size = json_file.stat().st_size if json_file.exists() else 0
-
-                sessions.append({
-                    "path": None,  # no directory exists
-                    "name": f"local_{session_uuid}",
-                    "org": org_dir.name[:8] + "...",
-                    "project": project_dir.name[:8] + "...",
-                    "size": size,
-                    "size_str": human_size(size),
-                    "last_modified": last_mod,
-                    "last_modified_str": last_mod_str,
-                    "is_archived": is_archived,
-                    "json_path": json_file,
-                    "title": title,
-                    "orphaned": True,
-                })
 
     return sessions
 
 
-def display_sessions(sessions, show_title="auto"):
+def discover_code_sessions():
+    """Walk the Code sessions root and find Code session metadata."""
+    sessions = []
+    if not CODE_SESSIONS_ROOT.exists():
+        return sessions
+
+    transcript_index = build_transcript_index()
+    active_sessions = load_active_code_sessions()
+    worktrees = load_git_worktrees().get("worktrees", {})
+
+    for org_dir in CODE_SESSIONS_ROOT.iterdir():
+        if not org_dir.is_dir():
+            continue
+
+        for project_dir in org_dir.iterdir():
+            if not project_dir.is_dir():
+                continue
+
+            for json_file in project_dir.iterdir():
+                if not json_file.is_file():
+                    continue
+
+                session_uuid = extract_session_uuid_from_metadata_path(json_file)
+                if session_uuid is None:
+                    continue
+
+                data = read_session_metadata(json_file)
+                session_id = session_id_from_uuid(session_uuid)
+                title = data.get("title") or data.get("name") or None if data else None
+                is_archived = data.get("isArchived", False) if data else False
+                cli_session_id = data.get("cliSessionId") if data else None
+                worktree_entry = worktrees.get(session_id, {})
+                worktree_path = (
+                    data.get("worktreePath") if data and data.get("worktreePath") else worktree_entry.get("path")
+                )
+                worktree_name = (
+                    data.get("worktreeName") if data and data.get("worktreeName") else worktree_entry.get("name")
+                )
+                history_paths = transcript_index.get(cli_session_id, []) if cli_session_id else []
+                active_info = active_sessions.get(
+                    cli_session_id,
+                    {"live_files": [], "stale_files": [], "live_pids": []},
+                )
+                last_mod = (
+                    data.get("lastActivityAt")
+                    if data and data.get("lastActivityAt")
+                    else data.get("createdAt")
+                    if data and data.get("createdAt")
+                    else json_file.stat().st_mtime
+                )
+                size = get_file_size(json_file)
+                size += sum(get_file_size(path) for path in history_paths)
+                size += sum(get_file_size(path) for path in active_info["stale_files"])
+
+                sessions.append(
+                    make_session_record(
+                        "code",
+                        session_id,
+                        org_dir.name,
+                        project_dir.name,
+                        size,
+                        last_mod,
+                        json_path=json_file,
+                        title=title,
+                        is_archived=is_archived,
+                        cli_session_id=cli_session_id,
+                        history_paths=history_paths,
+                        worktree_path=worktree_path,
+                        worktree_name=worktree_name,
+                        stale_session_files=active_info["stale_files"],
+                        live_session_files=active_info["live_files"],
+                        live_pids=active_info["live_pids"],
+                    )
+                )
+
+    return sessions
+
+
+def discover_sessions(kind="all"):
+    """Discover sessions for the requested kind."""
+    sessions = []
+    if kind in ("all", "cowork"):
+        sessions.extend(discover_cowork_sessions())
+    if kind in ("all", "code"):
+        sessions.extend(discover_code_sessions())
+    return sessions
+
+
+def get_status_label(session):
+    """Return the display status for a session."""
+    if session.get("orphaned"):
+        return "ORPHANED"
+    if session["kind"] == "code" and session["live_pids"]:
+        return "LIVE"
+    if session["is_archived"]:
+        return "ARCHIVED"
+    return "active"
+
+
+def display_sessions(sessions):
     """Print a numbered table of sessions."""
     if not sessions:
         print("No sessions found.")
         return
 
-    total_size = sum(s["size"] for s in sessions)
-    archived_count = sum(1 for s in sessions if s["is_archived"])
-    orphaned_count = sum(1 for s in sessions if s.get("orphaned"))
+    total_size = sum(session["size"] for session in sessions)
+    archived_count = sum(1 for session in sessions if session["is_archived"])
+    orphaned_count = sum(1 for session in sessions if session.get("orphaned"))
     active_count = len(sessions) - archived_count
+    cowork_count = sum(1 for session in sessions if session["kind"] == "cowork")
+    code_count = len(sessions) - cowork_count
+    live_code_count = sum(1 for session in sessions if session["kind"] == "code" and session["live_pids"])
 
-    print(f"\n{'='*90}")
-    print(f"  Cowork Session Manager")
-    summary_parts = [f"{len(sessions)} session(s)", f"{active_count} active", f"{archived_count} archived"]
+    print(f"\n{'=' * 104}")
+    print("  Claude Session Manager")
+    summary_parts = [
+        f"{len(sessions)} session(s)",
+        f"{cowork_count} cowork",
+        f"{code_count} code",
+        f"{active_count} active",
+        f"{archived_count} archived",
+    ]
     if orphaned_count > 0:
         summary_parts.append(f"{orphaned_count} orphaned")
+    if live_code_count > 0:
+        summary_parts.append(f"{live_code_count} live code")
     print(f"  {' | '.join(summary_parts)}  |  {human_size(total_size)} total")
-    print(f"{'='*90}\n")
+    print(f"{'=' * 104}\n")
 
     if orphaned_count > 0:
-        print(f"  ⚠  {orphaned_count} orphaned session(s) found (metadata without session data).")
-        print(f"     These still appear in the Claude sidebar. Delete them to clean up.\n")
+        print("  ⚠  Cowork orphaned metadata found (metadata without session data).")
+        print("     These still appear in the Claude sidebar. Delete them to clean up.\n")
 
-    # Decide whether to show title column
-    has_titles = any(s["title"] for s in sessions)
-
-    # Header
-    status_col = "Status"
+    has_titles = any(session["title"] for session in sessions)
     if has_titles:
-        print(f"  {'#':>3}  {status_col:<10} {'Last Modified':<18} {'Size':>10}  {'Title / Session ID'}")
-        print(f"  {'---':>3}  {'-'*8:<10} {'-'*16:<18} {'-'*10:>10}  {'-'*40}")
+        print(f"  {'#':>3}  {'Kind':<6} {'Status':<10} {'Last Modified':<18} {'Size':>10}  {'Title / Session ID'}")
+        print(f"  {'---':>3}  {'-' * 4:<6} {'-' * 8:<10} {'-' * 16:<18} {'-' * 10:>10}  {'-' * 40}")
     else:
-        print(f"  {'#':>3}  {status_col:<10} {'Last Modified':<18} {'Size':>10}  {'Session ID'}")
-        print(f"  {'---':>3}  {'-'*8:<10} {'-'*16:<18} {'-'*10:>10}  {'-'*40}")
+        print(f"  {'#':>3}  {'Kind':<6} {'Status':<10} {'Last Modified':<18} {'Size':>10}  {'Session ID'}")
+        print(f"  {'---':>3}  {'-' * 4:<6} {'-' * 8:<10} {'-' * 16:<18} {'-' * 10:>10}  {'-' * 40}")
 
-    for i, s in enumerate(sessions, 1):
-        session_id = s["name"].replace("local_", "")
-        if s.get("orphaned"):
-            status = "ORPHANED"
-        elif s["is_archived"]:
-            status = "ARCHIVED"
-        else:
-            status = "active"
-        display_name = s["title"] if s.get("title") else session_id
-        # Truncate long titles
-        if len(display_name) > 50:
-            display_name = display_name[:47] + "..."
-        print(f"  {i:>3}  {status:<10} {s['last_modified_str']:<18} {s['size_str']:>10}  {display_name}")
+    for index, session in enumerate(sessions, 1):
+        display_name = get_session_label(session)
+        if len(display_name) > 46:
+            display_name = display_name[:43] + "..."
+        print(
+            f"  {index:>3}  {session['kind'].upper():<6} {get_status_label(session):<10} "
+            f"{session['last_modified_str']:<18} {session['size_str']:>10}  {display_name}"
+        )
 
     print()
 
@@ -331,40 +630,89 @@ def parse_selection(text, count):
             try:
                 start, end = part.split("-", 1)
                 start, end = int(start.strip()), int(end.strip())
-                for n in range(start, end + 1):
-                    if 1 <= n <= count:
-                        indices.add(n - 1)
+                for number in range(start, end + 1):
+                    if 1 <= number <= count:
+                        indices.add(number - 1)
             except ValueError:
                 print(f"  Could not parse range: '{part}', skipping.")
         else:
             try:
-                n = int(part)
-                if 1 <= n <= count:
-                    indices.add(n - 1)
+                number = int(part)
+                if 1 <= number <= count:
+                    indices.add(number - 1)
                 else:
-                    print(f"  Number out of range: {n}, skipping.")
+                    print(f"  Number out of range: {number}, skipping.")
             except ValueError:
                 print(f"  Could not parse: '{part}', skipping.")
 
     return indices
 
 
+def delete_cowork_session(session):
+    """Delete Cowork session artifacts."""
+    if session["path"] and session["path"].exists():
+        shutil.rmtree(session["path"])
+    if session["json_path"] and session["json_path"].exists():
+        session["json_path"].unlink(missing_ok=True)
+
+
+def delete_code_session(session):
+    """Delete Code session artifacts without removing the git worktree."""
+    if session["live_pids"]:
+        pid_text = ", ".join(str(pid) for pid in session["live_pids"])
+        raise RuntimeError(f"session is still active (PID {pid_text})")
+
+    remove_git_worktree_entry(session["session_id"])
+
+    for session_file in session["stale_session_files"]:
+        if session_file.exists():
+            session_file.unlink(missing_ok=True)
+
+    for history_path in session["history_paths"]:
+        if history_path.exists():
+            history_path.unlink(missing_ok=True)
+            remove_empty_parents(history_path.parent, CLI_PROJECTS_ROOT)
+
+    if session["json_path"] and session["json_path"].exists():
+        session["json_path"].unlink(missing_ok=True)
+        remove_empty_parents(session["json_path"].parent, CODE_SESSIONS_ROOT)
+
+
 def action_delete(sessions, selected, dry_run):
     """Delete selected sessions."""
-    total_reclaim = sum(s["size"] for s in selected)
-    orphaned_count = sum(1 for s in selected if s.get("orphaned"))
+    blocked = [session for session in selected if session["kind"] == "code" and session["live_pids"]]
+    if blocked:
+        print("\n  Warning: active Code sessions cannot be deleted while Claude Desktop is still using them.")
+        for session in blocked:
+            pid_text = ", ".join(str(pid) for pid in session["live_pids"])
+            print(f"    - {get_session_label(session)} [CODE]  (PID {pid_text})")
+        selected = [session for session in selected if session not in blocked]
+        if not selected:
+            print("\n  No deletable sessions remain.")
+            return
+
+    total_reclaim = sum(session["size"] for session in selected)
+    orphaned_count = sum(1 for session in selected if session.get("orphaned"))
 
     print(f"\n  Sessions to DELETE ({human_size(total_reclaim)}):\n")
-    for s in selected:
-        session_id = s["name"].replace("local_", "")
-        label = s["title"] or session_id
-        suffix = "  [orphaned metadata only]" if s.get("orphaned") else ""
-        print(f"    - {label}  ({s['size_str']}, {s['last_modified_str']}){suffix}")
+    for session in selected:
+        suffixes = []
+        if session.get("orphaned"):
+            suffixes.append("orphaned metadata only")
+        if session["kind"] == "code" and session["history_paths"]:
+            suffixes.append(f"{len(session['history_paths'])} transcript(s)")
+        if session["kind"] == "code" and session["stale_session_files"]:
+            suffixes.append("stale session refs")
+        suffix = f"  [{' | '.join(suffixes)}]" if suffixes else ""
+        print(
+            f"    - {get_session_label(session)} [{session['kind'].upper()}]  "
+            f"({session['size_str']}, {session['last_modified_str']}){suffix}"
+        )
 
     if dry_run:
         print(f"\n  [DRY RUN] Would delete {len(selected)} session(s), freeing {human_size(total_reclaim)}.")
         if orphaned_count:
-            print(f"  [DRY RUN] {orphaned_count} orphaned metadata file(s) would be removed from sidebar.")
+            print(f"  [DRY RUN] {orphaned_count} orphaned Cowork metadata file(s) would be removed from the sidebar.")
         return
 
     print()
@@ -380,30 +728,25 @@ def action_delete(sessions, selected, dry_run):
 
     deleted = 0
     freed = 0
-    for s in selected:
+    for session in selected:
         try:
-            # Delete the session directory if it exists
-            if s["path"] and s["path"].exists():
-                shutil.rmtree(s["path"])
-            # Always remove the JSON metadata file (this is what the Claude
-            # sidebar reads — leaving it behind causes ghost entries)
-            if s["json_path"] and s["json_path"].exists():
-                s["json_path"].unlink(missing_ok=True)
+            if session["kind"] == "cowork":
+                delete_cowork_session(session)
+            else:
+                delete_code_session(session)
             deleted += 1
-            freed += s["size"]
-            label = s["title"] or s["name"].replace("local_", "")
-            print(f"  Deleted: {label}")
+            freed += session["size"]
+            print(f"  Deleted: {get_session_label(session)} [{session['kind'].upper()}]")
         except Exception as e:
-            print(f"  Error deleting {s['name']}: {e}")
+            print(f"  Error deleting {session['session_id']}: {e}")
 
     print(f"\n  Done. Deleted {deleted} session(s), freed {human_size(freed)}.")
-    print(f"  Restart Claude for sidebar changes to take effect.")
+    print("  Restart Claude for sidebar changes to take effect.")
 
 
 def action_archive(sessions, selected, dry_run):
-    """Archive selected sessions (hide from Cowork UI)."""
-    # Filter to only active sessions
-    to_archive = [s for s in selected if not s["is_archived"]]
+    """Archive selected sessions (hide from the Claude sidebar)."""
+    to_archive = [session for session in selected if not session["is_archived"]]
     already = len(selected) - len(to_archive)
 
     if already > 0:
@@ -414,19 +757,17 @@ def action_archive(sessions, selected, dry_run):
         return
 
     print(f"\n  Sessions to ARCHIVE ({len(to_archive)}):\n")
-    for s in to_archive:
-        session_id = s["name"].replace("local_", "")
-        label = s["title"] or session_id
-        print(f"    - {label}  ({s['last_modified_str']})")
+    for session in to_archive:
+        print(f"    - {get_session_label(session)} [{session['kind'].upper()}]  ({session['last_modified_str']})")
 
     if dry_run:
         print(f"\n  [DRY RUN] Would archive {len(to_archive)} session(s).")
         return
 
-    no_json = [s for s in to_archive if s["json_path"] is None]
+    no_json = [session for session in to_archive if session["json_path"] is None]
     if no_json:
         print(f"\n  Warning: {len(no_json)} session(s) have no JSON metadata file. These cannot be archived.")
-        to_archive = [s for s in to_archive if s["json_path"] is not None]
+        to_archive = [session for session in to_archive if session["json_path"] is not None]
         if not to_archive:
             return
 
@@ -442,18 +783,17 @@ def action_archive(sessions, selected, dry_run):
         return
 
     count = 0
-    for s in to_archive:
-        if set_archive_status(s["json_path"], True):
+    for session in to_archive:
+        if set_archive_status(session["json_path"], True):
             count += 1
-            label = s["title"] or s["name"].replace("local_", "")
-            print(f"  Archived: {label}")
+            print(f"  Archived: {get_session_label(session)} [{session['kind'].upper()}]")
 
-    print(f"\n  Done. Archived {count} session(s). Restart Claude for changes to take effect.")
+    print("\n  Done. Archived " + str(count) + " session(s). Restart Claude for changes to take effect.")
 
 
 def action_unarchive(sessions, selected, dry_run):
-    """Unarchive selected sessions (restore to Cowork UI)."""
-    to_unarchive = [s for s in selected if s["is_archived"]]
+    """Unarchive selected sessions (restore to the Claude sidebar)."""
+    to_unarchive = [session for session in selected if session["is_archived"]]
     already = len(selected) - len(to_unarchive)
 
     if already > 0:
@@ -464,19 +804,17 @@ def action_unarchive(sessions, selected, dry_run):
         return
 
     print(f"\n  Sessions to UNARCHIVE ({len(to_unarchive)}):\n")
-    for s in to_unarchive:
-        session_id = s["name"].replace("local_", "")
-        label = s["title"] or session_id
-        print(f"    - {label}  ({s['last_modified_str']})")
+    for session in to_unarchive:
+        print(f"    - {get_session_label(session)} [{session['kind'].upper()}]  ({session['last_modified_str']})")
 
     if dry_run:
         print(f"\n  [DRY RUN] Would unarchive {len(to_unarchive)} session(s).")
         return
 
-    no_json = [s for s in to_unarchive if s["json_path"] is None]
+    no_json = [session for session in to_unarchive if session["json_path"] is None]
     if no_json:
         print(f"\n  Warning: {len(no_json)} session(s) have no JSON metadata file. These cannot be unarchived.")
-        to_unarchive = [s for s in to_unarchive if s["json_path"] is not None]
+        to_unarchive = [session for session in to_unarchive if session["json_path"] is not None]
         if not to_unarchive:
             return
 
@@ -492,62 +830,61 @@ def action_unarchive(sessions, selected, dry_run):
         return
 
     count = 0
-    for s in to_unarchive:
-        if set_archive_status(s["json_path"], False):
+    for session in to_unarchive:
+        if set_archive_status(session["json_path"], False):
             count += 1
-            label = s["title"] or s["name"].replace("local_", "")
-            print(f"  Unarchived: {label}")
+            print(f"  Unarchived: {get_session_label(session)} [{session['kind'].upper()}]")
 
-    print(f"\n  Done. Unarchived {count} session(s). Restart Claude for changes to take effect.")
+    print("\n  Done. Unarchived " + str(count) + " session(s). Restart Claude for changes to take effect.")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Manage Claude Cowork sessions: list, delete, archive, and unarchive",
+        description="Manage Claude Cowork and Code sessions: list, delete, archive, and unarchive",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
   python3 cowork_session_cleaner.py                  # manage all sessions
-  python3 cowork_session_cleaner.py --archived       # show only archived
-  python3 cowork_session_cleaner.py --active         # show only active
+  python3 cowork_session_cleaner.py --kind code      # show only Code sessions
+  python3 cowork_session_cleaner.py --kind cowork    # show only Cowork sessions
+  python3 cowork_session_cleaner.py --archived       # show only archived sessions
+  python3 cowork_session_cleaner.py --active         # show only active sessions
   python3 cowork_session_cleaner.py --sort size      # sort biggest first
   python3 cowork_session_cleaner.py --dry-run        # preview, no changes
         """,
     )
     parser.add_argument("--dry-run", action="store_true", help="Preview changes without modifying anything")
     parser.add_argument("--sort", choices=["date", "size", "name"], default="date", help="Sort order (default: date)")
+    parser.add_argument("--kind", choices=["all", "cowork", "code"], default="all", help="Session kind to manage (default: all)")
     filter_group = parser.add_mutually_exclusive_group()
     filter_group.add_argument("--archived", action="store_true", help="Show only archived sessions")
     filter_group.add_argument("--active", action="store_true", help="Show only active (non-archived) sessions")
     args = parser.parse_args()
 
     print("\nScanning sessions...")
-    sessions = discover_sessions()
+    sessions = discover_sessions(args.kind)
 
-    # Filter by archive status
     if args.archived:
-        sessions = [s for s in sessions if s["is_archived"]]
+        sessions = [session for session in sessions if session["is_archived"]]
     elif args.active:
-        sessions = [s for s in sessions if not s["is_archived"]]
+        sessions = [session for session in sessions if not session["is_archived"]]
 
-    # Sort
     if args.sort == "size":
-        sessions.sort(key=lambda s: s["size"], reverse=True)
+        sessions.sort(key=lambda session: session["size"], reverse=True)
     elif args.sort == "name":
-        sessions.sort(key=lambda s: (s["title"] or s["name"]).lower())
+        sessions.sort(key=lambda session: (session["title"] or session["session_id"]).lower())
     else:
-        sessions.sort(key=lambda s: s["last_modified"], reverse=True)
+        sessions.sort(key=lambda session: session["last_modified"], reverse=True)
 
     display_sessions(sessions)
 
     if not sessions:
         return
 
-    # Action menu
     print("  What would you like to do?")
     print("    [D] Delete sessions")
-    print("    [A] Archive sessions (hide from Cowork)")
-    print("    [U] Unarchive sessions (restore to Cowork)")
+    print("    [A] Archive sessions (hide from the Claude sidebar)")
+    print("    [U] Unarchive sessions (restore to the Claude sidebar)")
     print("    [Q] Quit\n")
 
     try:
@@ -564,8 +901,7 @@ examples:
         print(f"  Unknown action: '{action}'")
         return
 
-    # Select sessions
-    print(f"\n  Enter session numbers.")
+    print("\n  Enter session numbers.")
     print("  Examples: 1,3,5  or  1-5  or  all")
     print("  Press Enter to cancel.\n")
 
@@ -580,14 +916,12 @@ examples:
         return
 
     indices = parse_selection(selection, len(sessions))
-
     if not indices:
         print("  No valid sessions selected.")
         return
 
-    selected = [sessions[i] for i in sorted(indices)]
+    selected = [sessions[index] for index in sorted(indices)]
 
-    # Dispatch action
     if action in ("d", "delete"):
         action_delete(sessions, selected, args.dry_run)
     elif action in ("a", "archive"):
