@@ -97,7 +97,7 @@ Cowork sessions live at:
 ~/Library/Application Support/Claude/local-agent-mode-sessions/<org-uuid>/<project-uuid>/local_<session-uuid>/
 ```
 
-Each session has a corresponding `local_<session-uuid>.json` metadata file in the project directory. The Claude app reads these JSON files to populate the sidebar — they contain the session title, archive status, and other metadata.
+Each session has a corresponding `local_<session-uuid>.json` metadata file in the project directory. The Claude app reads these JSON files to populate the sidebar — they contain the session title, archive status, and other metadata. The cleaner prefers this documented filename and also falls back to legacy `<session-uuid>.json` metadata files if they are present.
 
 - **Archiving/Unarchiving** sets `"isArchived": true` or `false` in the JSON file. Restart the Claude app for changes to appear.
 - **Deleting** removes both the session folder and the JSON metadata file. This is important because deleting only the folder leaves the JSON behind, which causes the session to appear as a ghost entry in the sidebar (visible but empty).

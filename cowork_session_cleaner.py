@@ -25,11 +25,38 @@ import sys
 import json
 import shutil
 import argparse
+import uuid
 from pathlib import Path
 from datetime import datetime
 
 
 SESSIONS_ROOT = Path.home() / "Library" / "Application Support" / "Claude" / "local-agent-mode-sessions"
+
+
+def session_metadata_candidate_names(session_uuid):
+    """Return supported metadata filenames for a session UUID."""
+    return (f"local_{session_uuid}.json", f"{session_uuid}.json")
+
+
+def extract_session_uuid_from_metadata_path(path):
+    """
+    Return the session UUID from a supported metadata filename, or None.
+
+    Supported shapes:
+    - local_<uuid>.json
+    - <uuid>.json
+    """
+    if path.suffix != ".json":
+        return None
+
+    stem = path.stem
+    if stem.startswith("local_"):
+        stem = stem.replace("local_", "", 1)
+
+    try:
+        return str(uuid.UUID(stem))
+    except ValueError:
+        return None
 
 
 def get_folder_size(path):
@@ -72,31 +99,27 @@ def get_last_modified(path):
 def find_session_json(session_dir):
     """
     Find the session metadata JSON file.
-    It is a <uuid>.json file sitting in the project directory (parent of session_dir),
-    or sometimes inside the session directory itself. We look for any .json file
-    whose name matches the session UUID pattern.
+    Claude stores metadata as local_<uuid>.json in the project directory (parent of
+    session_dir). Some older or unexpected layouts may use <uuid>.json instead, so
+    we check both names in both locations.
     """
     session_uuid = session_dir.name.replace("local_", "")
+    candidate_names = session_metadata_candidate_names(session_uuid)
 
-    # Check for <uuid>.json in the session folder itself
-    candidate = session_dir / f"{session_uuid}.json"
-    if candidate.exists():
-        return candidate
+    # Prefer the documented location first: project-level metadata next to
+    # session directories. Fall back to the session directory for robustness.
+    for base_dir in (session_dir.parent, session_dir):
+        for candidate_name in candidate_names:
+            candidate = base_dir / candidate_name
+            if candidate.exists():
+                return candidate
 
-    # Check for <uuid>.json in parent (project) folder
-    candidate = session_dir.parent / f"{session_uuid}.json"
-    if candidate.exists():
-        return candidate
-
-    # Broader search: any .json in session dir that could be metadata
-    for f in session_dir.iterdir():
-        if f.suffix == ".json" and f.stem == session_uuid:
-            return f
-
-    # Search parent for any json matching this session
-    for f in session_dir.parent.iterdir():
-        if f.suffix == ".json" and f.stem == session_uuid:
-            return f
+    # Broader search: any .json in either directory that matches this session's
+    # supported metadata filename shapes.
+    for base_dir in (session_dir.parent, session_dir):
+        for json_file in base_dir.iterdir():
+            if extract_session_uuid_from_metadata_path(json_file) == session_uuid:
+                return json_file
 
     return None
 
@@ -192,9 +215,9 @@ def discover_sessions():
             for json_file in project_dir.iterdir():
                 if not json_file.is_file():
                     continue
-                if not json_file.name.startswith("local_") or not json_file.suffix == ".json":
+                session_uuid = extract_session_uuid_from_metadata_path(json_file)
+                if session_uuid is None:
                     continue
-                session_uuid = json_file.stem.replace("local_", "")
                 if session_uuid in seen_uuids:
                     continue  # has a directory, already discovered
 
